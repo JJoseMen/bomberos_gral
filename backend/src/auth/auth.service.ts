@@ -2,13 +2,144 @@ import { Injectable, BadRequestException, UnauthorizedException } from '@nestjs/
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import * as bcrypt from 'bcrypt';
+import { OtpService } from './otp.service';
+import { EmailService } from '../email/email.service';
+
+interface KerverosPayload {
+  ci: string;
+  nombre: string;
+  grado?: string;
+  unidad?: string;
+  email: string;
+  role?: string;
+}
 
 @Injectable()
 export class AuthService {
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
+    private otpService: OtpService,
+    private emailService: EmailService,
   ) {}
+
+  // KERVEROS: Intercambio de token Kerveros por JWT interno
+  async exchangeKerverosToken(kerverosToken: string) {
+    // 1. Validar token de Kerveros (simulado en desarrollo)
+    const kerverosPayload = await this.validateKerverosToken(kerverosToken);
+
+    const { ci, nombre, grado, unidad, email } = kerverosPayload;
+
+    if (!ci || !email) {
+      throw new BadRequestException('Token de Kerveros inválido: faltan datos obligatorios (ci, email)');
+    }
+
+    // 2. Buscar o crear usuario en base de datos
+    let usuario = await this.prisma.usuario.findFirst({
+      where: { OR: [{ ci }, { email }] },
+    });
+
+    const datosActualizados = {
+      nombre_completo: nombre,
+      email,
+      ci,
+      grado: grado || null,
+      unidad: unidad || null,
+      tipo_persona: 'INTERNO', // Marcar como usuario interno
+      verificado: true,
+      activo: true,
+      ultimo_acceso: new Date(),
+    };
+
+    if (!usuario) {
+      // Crear nuevo usuario interno con contraseña aleatoria (no se usa para login Kerveros)
+      const salt = await bcrypt.genSalt(10);
+      const password_hash = await bcrypt.hash(`Kerveros_${Date.now()}_${Math.random().toString(36).slice(2)}`, salt);
+
+      usuario = await this.prisma.usuario.create({
+        data: {
+          ...datosActualizados,
+          password_hash,
+          telefono: '',
+          departamento: unidad || '',
+        },
+      });
+      console.log(`✅ Usuario INTERNO creado desde Kerveros: ${email} (CI: ${ci})`);
+    } else {
+      // Actualizar datos si cambiaron
+      await this.prisma.usuario.update({
+        where: { id: usuario.id },
+        data: datosActualizados,
+      });
+      console.log(`🔄 Usuario INTERNO actualizado desde Kerveros: ${email} (CI: ${ci})`);
+    }
+
+    // 3. Emitir JWT propio con role: 'INTERNO'
+    const payload = {
+      sub: usuario.id,
+      email: usuario.email,
+      nombre: usuario.nombre_completo,
+      ci: usuario.ci,
+      tipo_persona: usuario.tipo_persona,
+      role: 'INTERNO',
+      grado: usuario.grado,
+      unidad: usuario.unidad,
+    };
+
+    const token = this.jwtService.sign(payload);
+
+    return {
+      token,
+      user: {
+        id: usuario.id,
+        email: usuario.email,
+        nombre: usuario.nombre_completo,
+        ci: usuario.ci,
+        tipo_persona: usuario.tipo_persona,
+        role: 'INTERNO',
+        grado: usuario.grado,
+        unidad: usuario.unidad,
+      },
+    };
+  }
+
+  // Validación simulada del token Kerveros (en producción validar contra clave pública de policia.bo)
+  private async validateKerverosToken(token: string): Promise<KerverosPayload> {
+    // EN DESARROLLO: Decodificar sin verificar (simulación)
+    // EN PRODUCCIÓN: Verificar firma con clave pública de https://kerveros-dev.policia.bo/.well-known/jwks.json
+    try {
+      const payload = this.jwtService.decode(token) as KerverosPayload | null;
+      
+      if (!payload) {
+        throw new UnauthorizedException('Token de Kerveros inválido o malformado');
+      }
+
+      // Validar expiración si existe
+      if (payload['exp'] && Date.now() >= payload['exp'] * 1000) {
+        throw new UnauthorizedException('Token de Kerveros expirado');
+      }
+
+      console.log(`🔍 Kerveros payload decodificado:`, {
+        ci: payload.ci,
+        nombre: payload.nombre,
+        email: payload.email,
+        grado: payload.grado,
+        unidad: payload.unidad,
+      });
+
+      return {
+        ci: payload.ci,
+        nombre: payload.nombre,
+        grado: payload.grado,
+        unidad: payload.unidad,
+        email: payload.email,
+        role: payload.role,
+      };
+    } catch (error) {
+      if (error instanceof UnauthorizedException) throw error;
+      throw new UnauthorizedException('Error al validar token de Kerveros');
+    }
+  }
 
   // 1. Registro Inicial: Crea el usuario con una contraseña fija (o la que se le asigne)
   async register(data: {
@@ -78,34 +209,120 @@ export class AuthService {
     };
   }
 
-  // 2. Inicio de sesión con contraseña fija
+  // 2. Inicio de sesión - genera OTP y envía por email
   async login(data: { email?: string; correo?: string; password: string }) {
-    const userEmail = data.email || data.correo;
+    const email = data.email || data.correo;
 
-    if (!userEmail) {
+    if (!email) {
       throw new UnauthorizedException('El correo electrónico es obligatorio');
     }
 
-    const user = await this.prisma.usuario.findUnique({
-      where: { email: userEmail },
+    const usuario = await this.prisma.usuario.findUnique({
+      where: { email },
     });
 
-    if (!user) {
-      throw new UnauthorizedException('Credenciales incorrectas');
+    if (!usuario) {
+      throw new UnauthorizedException('Credenciales inválidas');
     }
 
-    const isPasswordValid = await bcrypt.compare(data.password, user.password_hash);
+    if (usuario.activo === false) {
+      throw new UnauthorizedException('Usuario inactivo');
+    }
+
+    const isPasswordValid = await bcrypt.compare(data.password, usuario.password_hash);
     if (!isPasswordValid) {
-      throw new UnauthorizedException('Contraseña incorrecta');
+      throw new UnauthorizedException('Credenciales inválidas');
     }
 
-    const codigoOTP = Math.floor(100000 + Math.random() * 900000).toString();
-    console.log(`[CÓDIGO OTP 2FA PARA ${userEmail}]: ${codigoOTP}`);
+    const { otp, codigo } = await this.otpService.createVerificationCode(usuario.id, 'LOGIN_2FA');
+
+    try {
+      await this.emailService.sendOTP(email, otp);
+    } catch (e) {
+      console.warn(`⚠️ No se pudo enviar email a ${email}:`, (e as Error).message);
+    }
+
+    console.log(`🔐 OTP para ${email}: ${otp} (expira en 10 min)`);
+    console.log(`📝 ID del código: ${codigo.id}`);
 
     return {
-      message: 'Contraseña validada. Ingrese el código OTP enviado a su correo.',
       requiereOtp: true,
-      email: user.email
+      email: usuario.email,
+      userId: usuario.id,
+      message: 'Código de verificación enviado a tu email',
+    };
+  }
+
+  // 2b. Reenvío OTP - genera nuevo código para el usuario
+  async resendOtp(data: { email?: string; correo?: string }) {
+    const email = data.email || data.correo;
+    if (!email) {
+      throw new BadRequestException('El correo electrónico es obligatorio');
+    }
+    const usuario = await this.prisma.usuario.findUnique({
+      where: { email },
+    });
+    if (!usuario) {
+      throw new UnauthorizedException('Usuario no encontrado');
+    }
+    if (usuario.activo === false) {
+      throw new UnauthorizedException('Usuario inactivo');
+    }
+    const { otp, codigo } = await this.otpService.createVerificationCode(usuario.id, 'LOGIN_2FA');
+    try {
+      await this.emailService.sendOTP(email, otp);
+    } catch (e) {
+      console.warn(`⚠️ No se pudo enviar email a ${email}:`, (e as Error).message);
+    }
+    console.log(`🔐 [RESEND] OTP para ${email}: ${otp} (expira en 10 min)`);
+    console.log(`📝 ID del código: ${codigo.id}`);
+    return {
+      message: 'Nuevo código de verificación enviado a tu email',
+      email: usuario.email,
+    };
+  }
+
+  // 2b. Verificación OTP - valida código y emite JWT
+  async verifyOtp(data: { email: string; codigo: string }) {
+    const { email, codigo } = data;
+
+    const usuario = await this.prisma.usuario.findUnique({
+      where: { email },
+      select: { id: true, email: true, nombre_completo: true, ci: true, tipo_persona: true },
+    });
+
+    if (!usuario) {
+      throw new UnauthorizedException('Usuario no encontrado');
+    }
+
+    await this.otpService.validateAndUseCode(usuario.id, codigo, 'LOGIN_2FA');
+
+    await this.prisma.usuario.update({
+      where: { id: usuario.id },
+      data: { ultimo_acceso: new Date() },
+    });
+
+    const payload = {
+      sub: usuario.id,
+      email: usuario.email,
+      nombre: usuario.nombre_completo,
+      ci: usuario.ci,
+      tipo_persona: usuario.tipo_persona,
+      role: 'EXTERNO',
+    };
+
+    const token = this.jwtService.sign(payload);
+
+    return {
+      token,
+      user: {
+        id: usuario.id,
+        email: usuario.email,
+        nombre: usuario.nombre_completo,
+        ci: usuario.ci,
+        tipo_persona: usuario.tipo_persona,
+        role: 'EXTERNO',
+      },
     };
   }
   // 3. Solicitar recuperación de contraseña ("Olvidé mi contraseña")
